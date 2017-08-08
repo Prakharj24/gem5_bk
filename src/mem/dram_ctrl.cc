@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2017 ARM Limited
+ * Copyright (c) 2010-2014 ARM Limited
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -41,10 +41,7 @@
  *          Ani Udipi
  *          Neha Agarwal
  *          Omar Naji
- *          Wendy Elsasser
  */
-
-#include "mem/dram_ctrl.hh"
 
 #include "base/bitfield.hh"
 #include "base/trace.hh"
@@ -52,6 +49,7 @@
 #include "debug/DRAMPower.hh"
 #include "debug/DRAMState.hh"
 #include "debug/Drain.hh"
+#include "mem/dram_ctrl.hh"
 #include "sim/system.hh"
 
 using namespace std;
@@ -62,9 +60,8 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     port(name() + ".port", *this), isTimingMode(false),
     retryRdReq(false), retryWrReq(false),
     busState(READ),
-    busStateNext(READ),
-    nextReqEvent([this]{ processNextReqEvent(); }, name()),
-    respondEvent([this]{ processRespondEvent(); }, name()),
+    nextReqEvent(this), respondEvent(this), nextTurn(this),
+    drainManager(NULL),
     deviceSize(p->device_size),
     deviceBusWidth(p->device_bus_width), burstLength(p->burst_length),
     deviceRowBufferSize(p->device_rowbuffer_size),
@@ -86,27 +83,47 @@ DRAMCtrl::DRAMCtrl(const DRAMCtrlParams* p) :
     tCK(p->tCK), tWTR(p->tWTR), tRTW(p->tRTW), tCS(p->tCS), tBURST(p->tBURST),
     tCCD_L(p->tCCD_L), tRCD(p->tRCD), tCL(p->tCL), tRP(p->tRP), tRAS(p->tRAS),
     tWR(p->tWR), tRTP(p->tRTP), tRFC(p->tRFC), tREFI(p->tREFI), tRRD(p->tRRD),
-    tRRD_L(p->tRRD_L), tXAW(p->tXAW), tXP(p->tXP), tXS(p->tXS),
-    activationLimit(p->activation_limit),
+    tRRD_L(p->tRRD_L), tXAW(p->tXAW), activationLimit(p->activation_limit),
     memSchedPolicy(p->mem_sched_policy), addrMapping(p->addr_mapping),
     pageMgmt(p->page_policy),
     maxAccessesPerRow(p->max_accesses_per_row),
     frontendLatency(p->static_frontend_latency),
     backendLatency(p->static_backend_latency),
     busBusyUntil(0), prevArrival(0),
-    nextReqTime(0), activeRank(0), timeStampOffset(0)
+    nextReqTime(0), activeRank(0), timeStampOffset(0), turn(0)
 {
     // sanity check the ranks since we rely on bit slicing for the
     // address decoding
     fatal_if(!isPowerOf2(ranksPerChannel), "DRAM rank count of %d is not "
              "allowed, must be a power of two\n", ranksPerChannel);
 
-    fatal_if(!isPowerOf2(burstSize), "DRAM burst size %d is not allowed, "
-             "must be a power of two\n", burstSize);
-
     for (int i = 0; i < ranksPerChannel; i++) {
-        Rank* rank = new Rank(*this, p, i);
+        Rank* rank = new Rank(*this, p);
         ranks.push_back(rank);
+
+        rank->actTicks.resize(activationLimit, 0);
+        rank->banks.resize(banksPerRank);
+        rank->rank = i;
+
+        for (int b = 0; b < banksPerRank; b++) {
+            rank->banks[b].bank = b;
+            // GDDR addressing of banks to BG is linear.
+            // Here we assume that all DRAM generations address bank groups as
+            // follows:
+            if (bankGroupArch) {
+                // Simply assign lower bits to bank group in order to
+                // rotate across bank groups as banks are incremented
+                // e.g. with 4 banks per bank group and 16 banks total:
+                //    banks 0,4,8,12  are in bank group 0
+                //    banks 1,5,9,13  are in bank group 1
+                //    banks 2,6,10,14 are in bank group 2
+                //    banks 3,7,11,15 are in bank group 3
+                rank->banks[b].bankgr = b % bankGroupsPerRank;
+            } else {
+                // No bank groups; simply assign to bank number
+                rank->banks[b].bankgr = b;
+            }
+        }
     }
 
     // perform a basic check of the write thresholds
@@ -249,19 +266,31 @@ DRAMCtrl::startup()
     }
 }
 
+/*
+Functions defined by me -
+*/
+
+void
+DRAMCtrl::changeTurn(){
+    if(turn==0) turn = 1;
+    else turn = 0;
+    deadTime = curTick() + 65000;
+    schedule(nextTurn, curTick() +  epoch);
+}
+
+
+
+
 Tick
 DRAMCtrl::recvAtomic(PacketPtr pkt)
 {
     DPRINTF(DRAM, "recvAtomic: %s 0x%x\n", pkt->cmdString(), pkt->getAddr());
 
-    panic_if(pkt->cacheResponding(), "Should not see packets where cache "
-             "is responding");
-
     // do the actual memory access and turn the packet into a response
     access(pkt);
 
     Tick latency = 0;
-    if (pkt->hasData()) {
+    if (!pkt->memInhibitAsserted() && pkt->hasData()) {
         // this value is not supposed to be accurate, just enough to
         // keep things going, mimic a closed page
         latency = tRP + tRCD + tCL;
@@ -325,8 +354,9 @@ DRAMCtrl::decodeAddr(PacketPtr pkt, Addr dramPktAddr, unsigned size,
         rank = addr % ranksPerChannel;
         addr = addr / ranksPerChannel;
 
-        // lastly, get the row bits, no need to remove them from addr
+        // lastly, get the row bits
         row = addr % rowsPerBank;
+        addr = addr / rowsPerBank;
     } else if (addrMapping == Enums::RoRaBaCoCh) {
         // take out the lower-order column bits
         addr = addr / columnsPerStripe;
@@ -347,8 +377,9 @@ DRAMCtrl::decodeAddr(PacketPtr pkt, Addr dramPktAddr, unsigned size,
         rank = addr % ranksPerChannel;
         addr = addr / ranksPerChannel;
 
-        // lastly, get the row bits, no need to remove them from addr
+        // lastly, get the row bits
         row = addr % rowsPerBank;
+        addr = addr / rowsPerBank;
     } else if (addrMapping == Enums::RoCoRaBaCh) {
         // optimise for closed page mode and utilise maximum
         // parallelism of the DRAM (at the cost of power)
@@ -373,8 +404,9 @@ DRAMCtrl::decodeAddr(PacketPtr pkt, Addr dramPktAddr, unsigned size,
         // next, the higher-order column bites
         addr = addr / (columnsPerRowBuffer / columnsPerStripe);
 
-        // lastly, get the row bits, no need to remove them from addr
+        // lastly, get the row bits
         row = addr % rowsPerBank;
+        addr = addr / rowsPerBank;
     } else
         panic("Unknown address mapping policy chosen!");
 
@@ -385,6 +417,7 @@ DRAMCtrl::decodeAddr(PacketPtr pkt, Addr dramPktAddr, unsigned size,
 
     DPRINTF(DRAM, "Address: %lld Rank %d Bank %d Row %d\n",
             dramPktAddr, rank, bank, row);
+
 
     // create the corresponding DRAM packet with the entry time and
     // ready time set to the current tick, the latter will be updated
@@ -421,22 +454,18 @@ DRAMCtrl::addToReadQueue(PacketPtr pkt, unsigned int pktCount)
         // First check write buffer to see if the data is already at
         // the controller
         bool foundInWrQ = false;
-        Addr burst_addr = burstAlign(addr);
-        // if the burst address is not present then there is no need
-        // looking any further
-        if (isInWriteQueue.find(burst_addr) != isInWriteQueue.end()) {
-            for (const auto& p : writeQueue) {
-                // check if the read is subsumed in the write queue
-                // packet we are looking at
-                if (p->addr <= addr && (addr + size) <= (p->addr + p->size)) {
-                    foundInWrQ = true;
-                    servicedByWrQ++;
-                    pktsServicedByWrQ++;
-                    DPRINTF(DRAM, "Read to addr %lld with size %d serviced by "
-                            "write queue\n", addr, size);
-                    bytesReadWrQ += burstSize;
-                    break;
-                }
+        for (auto i = writeQueue.begin(); i != writeQueue.end(); ++i) {
+            // check if the read is subsumed in the write entry we are
+            // looking at
+            if ((*i)->addr <= addr &&
+                (addr + size) <= ((*i)->addr + (*i)->size)) {
+                foundInWrQ = true;
+                servicedByWrQ++;
+                pktsServicedByWrQ++;
+                DPRINTF(DRAM, "Read to addr %lld with size %d serviced by "
+                        "write queue\n", addr, size);
+                bytesReadWrQ += burstSize;
+                break;
             }
         }
 
@@ -460,9 +489,6 @@ DRAMCtrl::addToReadQueue(PacketPtr pkt, unsigned int pktCount)
             DPRINTF(DRAM, "Adding to read queue\n");
 
             readQueue.push_back(dram_pkt);
-
-            // increment read entries of the rank
-            ++dram_pkt->rankRef.readEntries;
 
             // Update stats
             avgRdQLen = readQueue.size() + respQueue.size();
@@ -507,9 +533,63 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
         writeBursts++;
 
         // see if we can merge with an existing item in the write
-        // queue and keep track of whether we have merged or not
-        bool merged = isInWriteQueue.find(burstAlign(addr)) !=
-            isInWriteQueue.end();
+        // queue and keep track of whether we have merged or not so we
+        // can stop at that point and also avoid enqueueing a new
+        // request
+        bool merged = false;
+        auto w = writeQueue.begin();
+
+        while(!merged && w != writeQueue.end()) {
+            // either of the two could be first, if they are the same
+            // it does not matter which way we go
+            if ((*w)->addr >= addr) {
+                // the existing one starts after the new one, figure
+                // out where the new one ends with respect to the
+                // existing one
+                if ((addr + size) >= ((*w)->addr + (*w)->size)) {
+                    // check if the existing one is completely
+                    // subsumed in the new one
+                    DPRINTF(DRAM, "Merging write covering existing burst\n");
+                    merged = true;
+                    // update both the address and the size
+                    (*w)->addr = addr;
+                    (*w)->size = size;
+                } else if ((addr + size) >= (*w)->addr &&
+                           ((*w)->addr + (*w)->size - addr) <= burstSize) {
+                    // the new one is just before or partially
+                    // overlapping with the existing one, and together
+                    // they fit within a burst
+                    DPRINTF(DRAM, "Merging write before existing burst\n");
+                    merged = true;
+                    // the existing queue item needs to be adjusted with
+                    // respect to both address and size
+                    (*w)->size = (*w)->addr + (*w)->size - addr;
+                    (*w)->addr = addr;
+                }
+            } else {
+                // the new one starts after the current one, figure
+                // out where the existing one ends with respect to the
+                // new one
+                if (((*w)->addr + (*w)->size) >= (addr + size)) {
+                    // check if the new one is completely subsumed in the
+                    // existing one
+                    DPRINTF(DRAM, "Merging write into existing burst\n");
+                    merged = true;
+                    // no adjustments necessary
+                } else if (((*w)->addr + (*w)->size) >= addr &&
+                           (addr + size - (*w)->addr) <= burstSize) {
+                    // the existing one is just before or partially
+                    // overlapping with the new one, and together
+                    // they fit within a burst
+                    DPRINTF(DRAM, "Merging write after existing burst\n");
+                    merged = true;
+                    // the address is right, and only the size has
+                    // to be adjusted
+                    (*w)->size = addr + size - (*w)->addr;
+                }
+            }
+            ++w;
+        }
 
         // if the item was not merged we need to create a new write
         // and enqueue it
@@ -522,17 +602,10 @@ DRAMCtrl::addToWriteQueue(PacketPtr pkt, unsigned int pktCount)
             DPRINTF(DRAM, "Adding to write queue\n");
 
             writeQueue.push_back(dram_pkt);
-            isInWriteQueue.insert(burstAlign(addr));
-            assert(writeQueue.size() == isInWriteQueue.size());
 
             // Update stats
             avgWrQLen = writeQueue.size();
-
-            // increment write entries of the rank
-            ++dram_pkt->rankRef.writeEntries;
         } else {
-            DPRINTF(DRAM, "Merging write burst with existing queue entry\n");
-
             // keep track of the fact that this burst effectively
             // disappeared as it was merged with an existing one
             mergedWrBursts++;
@@ -576,15 +649,22 @@ DRAMCtrl::printQs() const {
 bool
 DRAMCtrl::recvTimingReq(PacketPtr pkt)
 {
+    /// @todo temporary hack to deal with memory corruption issues until
+    /// 4-phase transactions are complete
+    for (int x = 0; x < pendingDelete.size(); x++)
+        delete pendingDelete[x];
+    pendingDelete.clear();
+
     // This is where we enter from the outside world
     DPRINTF(DRAM, "recvTimingReq: request %s addr %lld size %d\n",
             pkt->cmdString(), pkt->getAddr(), pkt->getSize());
 
-    panic_if(pkt->cacheResponding(), "Should not see packets where cache "
-             "is responding");
-
-    panic_if(!(pkt->isRead() || pkt->isWrite()),
-             "Should only see read and writes at memory controller\n");
+    // simply drop inhibited packets for now
+    if (pkt->memInhibitAsserted()) {
+        DPRINTF(DRAM, "Inhibited packet -- Dropping it now\n");
+        pendingDelete.push_back(pkt);
+        return true;
+    }
 
     // Calc avg gap between requests
     if (prevArrival != 0) {
@@ -615,8 +695,7 @@ DRAMCtrl::recvTimingReq(PacketPtr pkt)
             readReqs++;
             bytesReadSys += size;
         }
-    } else {
-        assert(pkt->isWrite());
+    } else if (pkt->isWrite()) {
         assert(size != 0);
         if (writeQueueFull(dram_pkt_count)) {
             DPRINTF(DRAM, "Write queue full, not accepting\n");
@@ -629,6 +708,10 @@ DRAMCtrl::recvTimingReq(PacketPtr pkt)
             writeReqs++;
             bytesWrittenSys += size;
         }
+    } else {
+        DPRINTF(DRAM,"Neither read nor write, ignore timing\n");
+        neitherReadNorWrite++;
+        accessAndRespond(pkt, 1);
     }
 
     return true;
@@ -641,49 +724,6 @@ DRAMCtrl::processRespondEvent()
             "processRespondEvent(): Some req has reached its readyTime\n");
 
     DRAMPacket* dram_pkt = respQueue.front();
-
-    // if a read has reached its ready-time, decrement the number of reads
-    // At this point the packet has been handled and there is a possibility
-    // to switch to low-power mode if no other packet is available
-    --dram_pkt->rankRef.readEntries;
-    DPRINTF(DRAM, "number of read entries for rank %d is %d\n",
-            dram_pkt->rank, dram_pkt->rankRef.readEntries);
-
-    // counter should at least indicate one outstanding request
-    // for this read
-    assert(dram_pkt->rankRef.outstandingEvents > 0);
-    // read response received, decrement count
-    --dram_pkt->rankRef.outstandingEvents;
-
-    // at this moment should not have transitioned to a low-power state
-    assert((dram_pkt->rankRef.pwrState != PWR_SREF) &&
-           (dram_pkt->rankRef.pwrState != PWR_PRE_PDN) &&
-           (dram_pkt->rankRef.pwrState != PWR_ACT_PDN));
-
-    // track if this is the last packet before idling
-    // and that there are no outstanding commands to this rank
-    // if REF in progress, transition to LP state should not occur
-    // until REF completes
-    if ((dram_pkt->rankRef.refreshState == REF_IDLE) &&
-        (dram_pkt->rankRef.lowPowerEntryReady())) {
-        // verify that there are no events scheduled
-        assert(!dram_pkt->rankRef.activateEvent.scheduled());
-        assert(!dram_pkt->rankRef.prechargeEvent.scheduled());
-
-        // if coming from active state, schedule power event to
-        // active power-down else go to precharge power-down
-        DPRINTF(DRAMState, "Rank %d sleep at tick %d; current power state is "
-                "%d\n", dram_pkt->rank, curTick(), dram_pkt->rankRef.pwrState);
-
-        // default to ACT power-down unless already in IDLE state
-        // could be in IDLE if PRE issued before data returned
-        PowerState next_pwr_state = PWR_ACT_PDN;
-        if (dram_pkt->rankRef.pwrState == PWR_IDLE) {
-            next_pwr_state = PWR_PRE_PDN;
-        }
-
-        dram_pkt->rankRef.powerDownSleep(next_pwr_state, curTick());
-    }
 
     if (dram_pkt->burstHelper) {
         // it is a split packet
@@ -712,11 +752,11 @@ DRAMCtrl::processRespondEvent()
         schedule(respondEvent, respQueue.front()->readyTime);
     } else {
         // if there is nothing left in any queue, signal a drain
-        if (drainState() == DrainState::Draining &&
-            writeQueue.empty() && readQueue.empty() && allRanksDrained()) {
-
+        if (writeQueue.empty() && readQueue.empty() &&
+            drainManager) {
             DPRINTF(Drain, "DRAM controller done draining\n");
-            signalDrainDone();
+            drainManager->signalDrainDone();
+            drainManager = NULL;
         }
     }
 
@@ -729,12 +769,13 @@ DRAMCtrl::processRespondEvent()
 }
 
 bool
-DRAMCtrl::chooseNext(std::deque<DRAMPacket*>& queue, Tick extra_col_delay)
+DRAMCtrl::chooseNext(std::deque<DRAMPacket*>& queue, bool switched_cmd_type)
 {
+
     // This method does the arbitration between requests. The chosen
     // packet is simply moved to the head of the queue. The other
     // methods know that this is the place to look. For example, with
-    // FCFS, this method does nothing
+    // FCFS, this method does nothing.
     assert(!queue.empty());
 
     // bool to indicate if a packet to an available rank is found
@@ -742,8 +783,10 @@ DRAMCtrl::chooseNext(std::deque<DRAMPacket*>& queue, Tick extra_col_delay)
     if (queue.size() == 1) {
         DRAMPacket* dram_pkt = queue.front();
         // available rank corresponds to state refresh idle
-        if (ranks[dram_pkt->rank]->isAvailable()) {
+        if (ranks[dram_pkt->rank]->isAvailable() && dram_pkt->pkt->req->contextId() == turn && curTick() <= deadTime ) {
             found_packet = true;
+            // inform("core: %d\n", dram_pkt->pkt->req->contextId());
+
             DPRINTF(DRAM, "Single request, going to a free rank\n");
         } else {
             DPRINTF(DRAM, "Single request, going to a busy rank\n");
@@ -753,103 +796,80 @@ DRAMCtrl::chooseNext(std::deque<DRAMPacket*>& queue, Tick extra_col_delay)
 
     if (memSchedPolicy == Enums::fcfs) {
         // check if there is a packet going to a free rank
-        for (auto i = queue.begin(); i != queue.end() ; ++i) {
+        for(auto i = queue.begin(); i != queue.end() ; ++i) {
             DRAMPacket* dram_pkt = *i;
-            if (ranks[dram_pkt->rank]->isAvailable()) {
+            if (ranks[dram_pkt->rank]->isAvailable() && dram_pkt->pkt->req->contextId() == turn && curTick() <= deadTime) {
                 queue.erase(i);
                 queue.push_front(dram_pkt);
                 found_packet = true;
+                // inform("core: %d, turn %d\n", dram_pkt->pkt->req->contextId(), turn);
                 break;
             }
         }
     } else if (memSchedPolicy == Enums::frfcfs) {
-        found_packet = reorderQueue(queue, extra_col_delay);
+        found_packet = reorderQueue(queue, switched_cmd_type);
     } else
         panic("No scheduling policy chosen\n");
+    // inform("ContextID: %d\n", dram_pkt.pkt->req->hasContextId()? dram_pkt.pkt->req->contextId() : -1);
     return found_packet;
 }
 
 bool
-DRAMCtrl::reorderQueue(std::deque<DRAMPacket*>& queue, Tick extra_col_delay)
+DRAMCtrl::reorderQueue(std::deque<DRAMPacket*>& queue, bool switched_cmd_type)
 {
-    // Only determine this if needed
+    // Only determine this when needed
     uint64_t earliest_banks = 0;
-    bool hidden_bank_prep = false;
 
-    // search for seamless row hits first, if no seamless row hit is
-    // found then determine if there are other packets that can be issued
-    // without incurring additional bus delay due to bank timing
-    // Will select closed rows first to enable more open row possibilies
-    // in future selections
-    bool found_hidden_bank = false;
-
-    // remember if we found a row hit, not seamless, but bank prepped
-    // and ready
-    bool found_prepped_pkt = false;
-
-    // if we have no row hit, prepped or not, and no seamless packet,
-    // just go for the earliest possible
+    // Search for row hits first, if no row hit is found then schedule the
+    // packet to one of the earliest banks available
+    bool found_packet = false;
     bool found_earliest_pkt = false;
-
+    bool found_prepped_diff_rank_pkt = false;
     auto selected_pkt_it = queue.end();
-
-    // time we need to issue a column command to be seamless
-    const Tick min_col_at = std::max(busBusyUntil - tCL + extra_col_delay,
-                                     curTick());
 
     for (auto i = queue.begin(); i != queue.end() ; ++i) {
         DRAMPacket* dram_pkt = *i;
         const Bank& bank = dram_pkt->bankRef;
-
-        // check if rank is available, if not, jump to the next packet
+        // check if rank is busy. If this is the case jump to the next packet
+        // Check if it is a row hit
         if (dram_pkt->rankRef.isAvailable()) {
-            // check if it is a row hit
             if (bank.openRow == dram_pkt->row) {
-                // no additional rank-to-rank or same bank-group
-                // delays, or we switched read/write and might as well
-                // go for the row hit
-                if (bank.colAllowedAt <= min_col_at) {
-                    // FCFS within the hits, giving priority to
-                    // commands that can issue seamlessly, without
-                    // additional delay, such as same rank accesses
-                    // and/or different bank-group accesses
-                    DPRINTF(DRAM, "Seamless row buffer hit\n");
+                if (dram_pkt->rank == activeRank || switched_cmd_type) {
+                    // FCFS within the hits, giving priority to commands
+                    // that access the same rank as the previous burst
+                    // to minimize bus turnaround delays
+                    // Only give rank prioity when command type is
+                    // not changing
+                    DPRINTF(DRAM, "Row buffer hit\n");
                     selected_pkt_it = i;
-                    // no need to look through the remaining queue entries
                     break;
-                } else if (!found_hidden_bank && !found_prepped_pkt) {
-                    // if we did not find a packet to a closed row that can
-                    // issue the bank commands without incurring delay, and
-                    // did not yet find a packet to a prepped row, remember
-                    // the current one
+                } else if (!found_prepped_diff_rank_pkt) {
+                    // found row hit for command on different rank
+                    // than prev burst
                     selected_pkt_it = i;
-                    found_prepped_pkt = true;
-                    DPRINTF(DRAM, "Prepped row buffer hit\n");
+                    found_prepped_diff_rank_pkt = true;
                 }
-            } else if (!found_earliest_pkt) {
-                // if we have not initialised the bank status, do it
-                // now, and only once per scheduling decisions
-                if (earliest_banks == 0) {
-                    // determine entries with earliest bank delay
-                    pair<uint64_t, bool> bankStatus =
-                        minBankPrep(queue, min_col_at);
-                    earliest_banks = bankStatus.first;
-                    hidden_bank_prep = bankStatus.second;
-                }
+            } else if (!found_earliest_pkt & !found_prepped_diff_rank_pkt) {
+                // packet going to a rank which is currently not waiting for a
+                // refresh, No row hit and
+                // haven't found an entry with a row hit to a new rank
+                if (earliest_banks == 0)
+                    // Determine entries with earliest bank prep delay
+                    // Function will give priority to commands that access the
+                    // same rank as previous burst and can prep
+                    // the bank seamlessly
+                    earliest_banks = minBankPrep(queue, switched_cmd_type);
 
-                // bank is amongst first available banks
-                // minBankPrep will give priority to packets that can
-                // issue seamlessly
-                if (bits(earliest_banks, dram_pkt->bankId, dram_pkt->bankId)) {
+                // FCFS - Bank is first available bank
+                if (bits(earliest_banks, dram_pkt->bankId,
+                    dram_pkt->bankId)) {
+                    // Remember the packet to be scheduled to one of
+                    // the earliest banks available, FCFS amongst the
+                    // earliest banks
+                    selected_pkt_it = i;
+                    //if the packet found is going to a rank that is currently
+                    //not busy then update the found_packet to true
                     found_earliest_pkt = true;
-                    found_hidden_bank = hidden_bank_prep;
-
-                    // give priority to packets that can issue
-                    // bank commands 'behind the scenes'
-                    // any additional delay if any will be due to
-                    // col-to-col command requirements
-                    if (hidden_bank_prep || !found_prepped_pkt)
-                        selected_pkt_it = i;
                 }
             }
         }
@@ -859,10 +879,9 @@ DRAMCtrl::reorderQueue(std::deque<DRAMPacket*>& queue, Tick extra_col_delay)
         DRAMPacket* selected_pkt = *selected_pkt_it;
         queue.erase(selected_pkt_it);
         queue.push_front(selected_pkt);
-        return true;
+        found_packet = true;
     }
-
-    return false;
+    return found_packet;
 }
 
 void
@@ -890,11 +909,11 @@ DRAMCtrl::accessAndRespond(PacketPtr pkt, Tick static_latency)
 
         // queue the packet in the response queue to be sent out after
         // the static latency has passed
-        port.schedTimingResp(pkt, response_time, true);
+        port.schedTimingResp(pkt, response_time);
     } else {
         // @todo the packet is going to be deleted, and the DRAMPacket
         // is still having a pointer to it
-        pendingDelete.reset(pkt);
+        pendingDelete.push_back(pkt);
     }
 
     DPRINTF(DRAM, "Done\n");
@@ -927,8 +946,9 @@ DRAMCtrl::activateBank(Rank& rank_ref, Bank& bank_ref,
             bank_ref.bank, rank_ref.rank, act_tick,
             ranks[rank_ref.rank]->numBanksActive);
 
-    rank_ref.cmdList.push_back(Command(MemCommand::ACT, bank_ref.bank,
-                               act_tick));
+    rank_ref.power.powerlib.doCommand(MemCommand::ACT, bank_ref.bank,
+                                      divCeil(act_tick, tCK) -
+                                      timeStampOffset);
 
     DPRINTF(DRAMPower, "%llu,ACT,%d,%d\n", divCeil(act_tick, tCK) -
             timeStampOffset, bank_ref.bank, rank_ref.rank);
@@ -940,7 +960,7 @@ DRAMCtrl::activateBank(Rank& rank_ref, Bank& bank_ref,
     bank_ref.colAllowedAt = std::max(act_tick + tRCD, bank_ref.colAllowedAt);
 
     // start by enforcing tRRD
-    for (int i = 0; i < banksPerRank; i++) {
+    for(int i = 0; i < banksPerRank; i++) {
         // next activate to any bank in this rank must not happen
         // before tRRD
         if (bankGroupArch && (bank_ref.bankgr == rank_ref.banks[i].bankgr)) {
@@ -985,7 +1005,7 @@ DRAMCtrl::activateBank(Rank& rank_ref, Bank& bank_ref,
             DPRINTF(DRAM, "Enforcing tXAW with X = %d, next activate "
                     "no earlier than %llu\n", activationLimit,
                     rank_ref.actTicks.back() + tXAW);
-            for (int j = 0; j < banksPerRank; j++)
+            for(int j = 0; j < banksPerRank; j++)
                 // next activate must not happen before end of window
                 rank_ref.banks[j].actAllowedAt =
                     std::max(rank_ref.actTicks.back() + tXAW,
@@ -1030,8 +1050,9 @@ DRAMCtrl::prechargeBank(Rank& rank_ref, Bank& bank, Tick pre_at, bool trace)
 
     if (trace) {
 
-        rank_ref.cmdList.push_back(Command(MemCommand::PRE, bank.bank,
-                                   pre_at));
+        rank_ref.power.powerlib.doCommand(MemCommand::PRE, bank.bank,
+                                                divCeil(pre_at, tCK) -
+                                                timeStampOffset);
         DPRINTF(DRAMPower, "%llu,PRE,%d,%d\n", divCeil(pre_at, tCK) -
                 timeStampOffset, bank.bank, rank_ref.rank);
     }
@@ -1041,13 +1062,10 @@ DRAMCtrl::prechargeBank(Rank& rank_ref, Bank& bank, Tick pre_at, bool trace)
     // would have reached the idle state, so schedule an event and
     // rather check once we actually make it to the point in time when
     // the (last) precharge takes place
-    if (!rank_ref.prechargeEvent.scheduled()) {
+    if (!rank_ref.prechargeEvent.scheduled())
         schedule(rank_ref.prechargeEvent, pre_done_at);
-        // New event, increment count
-        ++rank_ref.outstandingEvents;
-    } else if (rank_ref.prechargeEvent.when() < pre_done_at) {
+    else if (rank_ref.prechargeEvent.when() < pre_done_at)
         reschedule(rank_ref.prechargeEvent, pre_done_at);
-    }
 }
 
 void
@@ -1058,14 +1076,6 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 
     // get the rank
     Rank& rank = dram_pkt->rankRef;
-
-    // are we in or transitioning to a low-power state and have not scheduled
-    // a power-up event?
-    // if so, wake up from power down to issue RD/WR burst
-    if (rank.inLowPowerState) {
-        assert(rank.pwrState != PWR_SREF);
-        rank.scheduleWakeUpEvent(tXP);
-    }
 
     // get the bank
     Bank& bank = dram_pkt->bankRef;
@@ -1112,8 +1122,8 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
     // update the time for the next read/write burst for each
     // bank (add a max with tCCD/tCCD_L here)
     Tick cmd_dly;
-    for (int j = 0; j < ranksPerChannel; j++) {
-        for (int i = 0; i < banksPerRank; i++) {
+    for(int j = 0; j < ranksPerChannel; j++) {
+        for(int i = 0; i < banksPerRank; i++) {
             // next burst to same bank group in this rank must not happen
             // before tCCD_L.  Different bank group timing requirement is
             // tBURST; Add tCS for different ranks
@@ -1185,12 +1195,11 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
         // currently dealing with (which is the head of the queue)
         ++p;
 
-        // keep on looking until we find a hit or reach the end of the queue
-        // 1) if a hit is found, then both open and close adaptive policies keep
-        // the page open
-        // 2) if no hit is found, got_bank_conflict is set to true if a bank
-        // conflict request is waiting in the queue
-        while (!got_more_hits && p != queue.end()) {
+        // keep on looking until we have found required condition or
+        // reached the end
+        while (!(got_more_hits &&
+                 (got_bank_conflict || pageMgmt == Enums::close_adaptive)) &&
+               p != queue.end()) {
             bool same_rank_bank = (dram_pkt->rank == (*p)->rank) &&
                 (dram_pkt->bank == (*p)->bank);
             bool same_row = dram_pkt->row == (*p)->row;
@@ -1214,20 +1223,8 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
     MemCommand::cmds command = (mem_cmd == "RD") ? MemCommand::RD :
                                                    MemCommand::WR;
 
-    // Update bus state
-    busBusyUntil = dram_pkt->readyTime;
-
-    DPRINTF(DRAM, "Access to %lld, ready at %lld bus busy until %lld.\n",
-            dram_pkt->addr, dram_pkt->readyTime, busBusyUntil);
-
-    dram_pkt->rankRef.cmdList.push_back(Command(command, dram_pkt->bank,
-                                        cmd_at));
-
-    DPRINTF(DRAMPower, "%llu,%s,%d,%d\n", divCeil(cmd_at, tCK) -
-            timeStampOffset, mem_cmd, dram_pkt->bank, dram_pkt->rank);
-
     // if this access should use auto-precharge, then we are
-    // closing the row after the read/write burst
+    // closing the row
     if (auto_precharge) {
         // if auto-precharge push a PRE command at the correct tick to the
         // list used by DRAMPower library to calculate power
@@ -1235,6 +1232,19 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 
         DPRINTF(DRAM, "Auto-precharged bank: %d\n", dram_pkt->bankId);
     }
+
+    // Update bus state
+    busBusyUntil = dram_pkt->readyTime;
+
+    DPRINTF(DRAM, "Access to %lld, ready at %lld bus busy until %lld.\n",
+            dram_pkt->addr, dram_pkt->readyTime, busBusyUntil);
+
+    dram_pkt->rankRef.power.powerlib.doCommand(command, dram_pkt->bank,
+                                                 divCeil(cmd_at, tCK) -
+                                                 timeStampOffset);
+
+    DPRINTF(DRAMPower, "%llu,%s,%d,%d\n", divCeil(cmd_at, tCK) -
+            timeStampOffset, mem_cmd, dram_pkt->bank, dram_pkt->rank);
 
     // Update the minimum timing between the requests, this is a
     // conservative estimate of when we have to schedule the next
@@ -1266,36 +1276,20 @@ DRAMCtrl::doDRAMAccess(DRAMPacket* dram_pkt)
 void
 DRAMCtrl::processNextReqEvent()
 {
+
+    if(!nextTurn.scheduled()){
+        schedule(nextTurn, curTick() + epoch);
+    }
+
     int busyRanks = 0;
     for (auto r : ranks) {
         if (!r->isAvailable()) {
-            if (r->pwrState != PWR_SREF) {
-                // rank is busy refreshing
-                DPRINTF(DRAMState, "Rank %d is not available\n", r->rank);
-                busyRanks++;
+            // rank is busy refreshing
+            busyRanks++;
 
-                // let the rank know that if it was waiting to drain, it
-                // is now done and ready to proceed
-                r->checkDrainDone();
-            }
-
-            // check if we were in self-refresh and haven't started
-            // to transition out
-            if ((r->pwrState == PWR_SREF) && r->inLowPowerState) {
-                DPRINTF(DRAMState, "Rank %d is in self-refresh\n", r->rank);
-                // if we have commands queued to this rank and we don't have
-                // a minimum number of active commands enqueued,
-                // exit self-refresh
-                if (r->forceSelfRefreshExit()) {
-                    DPRINTF(DRAMState, "rank %d was in self refresh and"
-                           " should wake up\n", r->rank);
-                    //wake up from self-refresh
-                    r->scheduleWakeUpEvent(tXS);
-                    // things are brought back into action once a refresh is
-                    // performed after self-refresh
-                    // continue with selection for other ranks
-                }
-            }
+            // let the rank know that if it was waiting to drain, it
+            // is now done and ready to proceed
+            r->checkDrainDone();
         }
     }
 
@@ -1306,32 +1300,30 @@ DRAMCtrl::processNextReqEvent()
         return;
     }
 
-    // pre-emptively set to false.  Overwrite if in transitioning to
-    // a new state
+    // pre-emptively set to false.  Overwrite if in READ_TO_WRITE
+    // or WRITE_TO_READ state
     bool switched_cmd_type = false;
-    if (busState != busStateNext) {
-        if (busState == READ) {
-            DPRINTF(DRAM, "Switching to writes after %d reads with %d reads "
-                    "waiting\n", readsThisTime, readQueue.size());
+    if (busState == READ_TO_WRITE) {
+        DPRINTF(DRAM, "Switching to writes after %d reads with %d reads "
+                "waiting\n", readsThisTime, readQueue.size());
 
-            // sample and reset the read-related stats as we are now
-            // transitioning to writes, and all reads are done
-            rdPerTurnAround.sample(readsThisTime);
-            readsThisTime = 0;
+        // sample and reset the read-related stats as we are now
+        // transitioning to writes, and all reads are done
+        rdPerTurnAround.sample(readsThisTime);
+        readsThisTime = 0;
 
-            // now proceed to do the actual writes
-            switched_cmd_type = true;
-        } else {
-            DPRINTF(DRAM, "Switching to reads after %d writes with %d writes "
-                    "waiting\n", writesThisTime, writeQueue.size());
+        // now proceed to do the actual writes
+        busState = WRITE;
+        switched_cmd_type = true;
+    } else if (busState == WRITE_TO_READ) {
+        DPRINTF(DRAM, "Switching to reads after %d writes with %d writes "
+                "waiting\n", writesThisTime, writeQueue.size());
 
-            wrPerTurnAround.sample(writesThisTime);
-            writesThisTime = 0;
+        wrPerTurnAround.sample(writesThisTime);
+        writesThisTime = 0;
 
-            switched_cmd_type = true;
-        }
-        // update busState to match next state until next transition
-        busState = busStateNext;
+        busState = READ;
+        switched_cmd_type = true;
     }
 
     // when we get here it is either a read or a write
@@ -1345,20 +1337,15 @@ DRAMCtrl::processNextReqEvent()
             // trigger writes if we have passed the low threshold (or
             // if we are draining)
             if (!writeQueue.empty() &&
-                (drainState() == DrainState::Draining ||
-                 writeQueue.size() > writeLowThreshold)) {
+                (drainManager || writeQueue.size() > writeLowThreshold)) {
 
                 switch_to_writes = true;
             } else {
                 // check if we are drained
-                // not done draining until in PWR_IDLE state
-                // ensuring all banks are closed and
-                // have exited low power states
-                if (drainState() == DrainState::Draining &&
-                    respQueue.empty() && allRanksDrained()) {
-
+                if (respQueue.empty () && drainManager) {
                     DPRINTF(Drain, "DRAM controller done draining\n");
-                    signalDrainDone();
+                    drainManager->signalDrainDone();
+                    drainManager = NULL;
                 }
 
                 // nothing to do, not even any point in scheduling an
@@ -1371,10 +1358,7 @@ DRAMCtrl::processNextReqEvent()
 
             // Figure out which read request goes next, and move it to the
             // front of the read queue
-            // If we are changing command type, incorporate the minimum
-            // bus turnaround delay which will be tCS (different rank) case
-            found_read = chooseNext(readQueue,
-                             switched_cmd_type ? tCS : 0);
+            found_read = chooseNext(readQueue, switched_cmd_type);
 
             // if no read to an available rank is found then return
             // at this point. There could be writes to the available ranks
@@ -1386,7 +1370,6 @@ DRAMCtrl::processNextReqEvent()
 
             DRAMPacket* dram_pkt = readQueue.front();
             assert(dram_pkt->rankRef.isAvailable());
-
             // here we get a bit creative and shift the bus busy time not
             // just the tWTR, but also a CAS latency to capture the fact
             // that we are allowed to prepare a new bank, but not issue a
@@ -1400,9 +1383,6 @@ DRAMCtrl::processNextReqEvent()
 
             // At this point we're done dealing with the request
             readQueue.pop_front();
-
-            // Every respQueue which will generate an event, increment count
-            ++dram_pkt->rankRef.outstandingEvents;
 
             // sanity check
             assert(dram_pkt->size <= burstSize);
@@ -1431,16 +1411,13 @@ DRAMCtrl::processNextReqEvent()
         // draining), or because the writes hit the hight threshold
         if (switch_to_writes) {
             // transition to writing
-            busStateNext = WRITE;
+            busState = READ_TO_WRITE;
         }
     } else {
         // bool to check if write to free rank is found
         bool found_write = false;
 
-        // If we are changing command type, incorporate the minimum
-        // bus turnaround delay
-        found_write = chooseNext(writeQueue,
-                                 switched_cmd_type ? std::min(tRTW, tCS) : 0);
+        found_write = chooseNext(writeQueue, switched_cmd_type);
 
         // if no writes to an available rank are found then return.
         // There could be reads to the available ranks. However, to avoid
@@ -1465,27 +1442,6 @@ DRAMCtrl::processNextReqEvent()
         doDRAMAccess(dram_pkt);
 
         writeQueue.pop_front();
-
-        // removed write from queue, decrement count
-        --dram_pkt->rankRef.writeEntries;
-
-        // Schedule write done event to decrement event count
-        // after the readyTime has been reached
-        // Only schedule latest write event to minimize events
-        // required; only need to ensure that final event scheduled covers
-        // the time that writes are outstanding and bus is active
-        // to holdoff power-down entry events
-        if (!dram_pkt->rankRef.writeDoneEvent.scheduled()) {
-            schedule(dram_pkt->rankRef.writeDoneEvent, dram_pkt->readyTime);
-            // New event, increment count
-            ++dram_pkt->rankRef.outstandingEvents;
-
-        } else if (dram_pkt->rankRef.writeDoneEvent.when() <
-                   dram_pkt-> readyTime) {
-            reschedule(dram_pkt->rankRef.writeDoneEvent, dram_pkt->readyTime);
-        }
-
-        isInWriteQueue.erase(burstAlign(dram_pkt->addr));
         delete dram_pkt;
 
         // If we emptied the write queue, or got sufficiently below the
@@ -1494,10 +1450,10 @@ DRAMCtrl::processNextReqEvent()
         // writes, then switch to reads.
         if (writeQueue.empty() ||
             (writeQueue.size() + minWritesPerSwitch < writeLowThreshold &&
-             drainState() != DrainState::Draining) ||
+             !drainManager) ||
             (!readQueue.empty() && writesThisTime >= minWritesPerSwitch)) {
             // turn the bus back around for reads again
-            busStateNext = READ;
+            busState = WRITE_TO_READ;
 
             // note that the we switch back to reads also in the idle
             // case, which eventually will check for any draining and
@@ -1520,34 +1476,27 @@ DRAMCtrl::processNextReqEvent()
     }
 }
 
-pair<uint64_t, bool>
+uint64_t
 DRAMCtrl::minBankPrep(const deque<DRAMPacket*>& queue,
-                      Tick min_col_at) const
+                      bool switched_cmd_type) const
 {
     uint64_t bank_mask = 0;
     Tick min_act_at = MaxTick;
 
-    // latest Tick for which ACT can occur without incurring additoinal
-    // delay on the data bus
-    const Tick hidden_act_max = std::max(min_col_at - tRCD, curTick());
+    uint64_t bank_mask_same_rank = 0;
+    Tick min_act_at_same_rank = MaxTick;
 
-    // Flag condition when burst can issue back-to-back with previous burst
-    bool found_seamless_bank = false;
-
-    // Flag condition when bank can be opened without incurring additional
-    // delay on the data bus
-    bool hidden_bank_prep = false;
+    // Give precedence to commands that access same rank as previous command
+    bool same_rank_match = false;
 
     // determine if we have queued transactions targetting the
     // bank in question
     vector<bool> got_waiting(ranksPerChannel * banksPerRank, false);
     for (const auto& p : queue) {
-        if (p->rankRef.isAvailable())
+        if(p->rankRef.isAvailable())
             got_waiting[p->bankId] = true;
     }
 
-    // Find command with optimal bank timing
-    // Will prioritize commands that can issue seamlessly.
     for (int i = 0; i < ranksPerChannel; i++) {
         for (int j = 0; j < banksPerRank; j++) {
             uint16_t bank_id = i * banksPerRank + j;
@@ -1561,83 +1510,79 @@ DRAMCtrl::minBankPrep(const deque<DRAMPacket*>& queue,
                 // an activate, ignoring any rank-to-rank switching
                 // cost in this calculation
                 Tick act_at = ranks[i]->banks[j].openRow == Bank::NO_ROW ?
-                    std::max(ranks[i]->banks[j].actAllowedAt, curTick()) :
+                    ranks[i]->banks[j].actAllowedAt :
                     std::max(ranks[i]->banks[j].preAllowedAt, curTick()) + tRP;
 
-                // When is the earliest the R/W burst can issue?
-                Tick col_at = std::max(ranks[i]->banks[j].colAllowedAt,
-                                       act_at + tRCD);
+                // prioritize commands that access the
+                // same rank as previous burst
+                // Calculate bank mask separately for the case and
+                // evaluate after loop iterations complete
+                if (i == activeRank && ranksPerChannel > 1) {
+                    if (act_at <= min_act_at_same_rank) {
+                        // reset same rank bank mask if new minimum is found
+                        // and previous minimum could not immediately send ACT
+                        if (act_at < min_act_at_same_rank &&
+                            min_act_at_same_rank > curTick())
+                            bank_mask_same_rank = 0;
 
-                // bank can issue burst back-to-back (seamlessly) with
-                // previous burst
-                bool new_seamless_bank = col_at <= min_col_at;
+                        // Set flag indicating that a same rank
+                        // opportunity was found
+                        same_rank_match = true;
 
-                // if we found a new seamless bank or we have no
-                // seamless banks, and got a bank with an earlier
-                // activate time, it should be added to the bit mask
-                if (new_seamless_bank ||
-                    (!found_seamless_bank && act_at <= min_act_at)) {
-                    // if we did not have a seamless bank before, and
-                    // we do now, reset the bank mask, also reset it
-                    // if we have not yet found a seamless bank and
-                    // the activate time is smaller than what we have
-                    // seen so far
-                    if (!found_seamless_bank &&
-                        (new_seamless_bank || act_at < min_act_at)) {
-                        bank_mask = 0;
+                        // set the bit corresponding to the available bank
+                        replaceBits(bank_mask_same_rank, bank_id, bank_id, 1);
+                        min_act_at_same_rank = act_at;
                     }
-
-                    found_seamless_bank |= new_seamless_bank;
-
-                    // ACT can occur 'behind the scenes'
-                    hidden_bank_prep = act_at <= hidden_act_max;
-
-                    // set the bit corresponding to the available bank
-                    replaceBits(bank_mask, bank_id, bank_id, 1);
-                    min_act_at = act_at;
+                } else {
+                    if (act_at <= min_act_at) {
+                        // reset bank mask if new minimum is found
+                        // and either previous minimum could not immediately send ACT
+                        if (act_at < min_act_at && min_act_at > curTick())
+                            bank_mask = 0;
+                        // set the bit corresponding to the available bank
+                        replaceBits(bank_mask, bank_id, bank_id, 1);
+                        min_act_at = act_at;
+                    }
                 }
             }
         }
     }
 
-    return make_pair(bank_mask, hidden_bank_prep);
+    // Determine the earliest time when the next burst can issue based
+    // on the current busBusyUntil delay.
+    // Offset by tRCD to correlate with ACT timing variables
+    Tick min_cmd_at = busBusyUntil - tCL - tRCD;
+
+    // if we have multiple ranks and all
+    // waiting packets are accessing a rank which was previously active
+    // then bank_mask_same_rank will be set to a value while bank_mask will
+    // remain 0. In this case, the function should return the value of
+    // bank_mask_same_rank.
+    // else if waiting packets access a rank which was previously active and
+    // other ranks, prioritize same rank accesses that can issue B2B
+    // Only optimize for same ranks when the command type
+    // does not change; do not want to unnecessarily incur tWTR
+    //
+    // Resulting FCFS prioritization Order is:
+    // 1) Commands that access the same rank as previous burst
+    //    and can prep the bank seamlessly.
+    // 2) Commands (any rank) with earliest bank prep
+    if ((bank_mask == 0) || (!switched_cmd_type && same_rank_match &&
+        min_act_at_same_rank <= min_cmd_at)) {
+        bank_mask = bank_mask_same_rank;
+    }
+
+    return bank_mask;
 }
 
-DRAMCtrl::Rank::Rank(DRAMCtrl& _memory, const DRAMCtrlParams* _p, int rank)
+DRAMCtrl::Rank::Rank(DRAMCtrl& _memory, const DRAMCtrlParams* _p)
     : EventManager(&_memory), memory(_memory),
-      pwrStateTrans(PWR_IDLE), pwrStatePostRefresh(PWR_IDLE),
-      pwrStateTick(0), refreshDueAt(0), pwrState(PWR_IDLE),
-      refreshState(REF_IDLE), inLowPowerState(false), rank(rank),
-      readEntries(0), writeEntries(0), outstandingEvents(0),
-      wakeUpAllowedAt(0), power(_p, false), banks(_p->banks_per_rank),
-      numBanksActive(0), actTicks(_p->activation_limit, 0),
-      writeDoneEvent([this]{ processWriteDoneEvent(); }, name()),
-      activateEvent([this]{ processActivateEvent(); }, name()),
-      prechargeEvent([this]{ processPrechargeEvent(); }, name()),
-      refreshEvent([this]{ processRefreshEvent(); }, name()),
-      powerEvent([this]{ processPowerEvent(); }, name()),
-      wakeUpEvent([this]{ processWakeUpEvent(); }, name())
-{
-    for (int b = 0; b < _p->banks_per_rank; b++) {
-        banks[b].bank = b;
-        // GDDR addressing of banks to BG is linear.
-        // Here we assume that all DRAM generations address bank groups as
-        // follows:
-        if (_p->bank_groups_per_rank > 0) {
-            // Simply assign lower bits to bank group in order to
-            // rotate across bank groups as banks are incremented
-            // e.g. with 4 banks per bank group and 16 banks total:
-            //    banks 0,4,8,12  are in bank group 0
-            //    banks 1,5,9,13  are in bank group 1
-            //    banks 2,6,10,14 are in bank group 2
-            //    banks 3,7,11,15 are in bank group 3
-            banks[b].bankgr = b % _p->bank_groups_per_rank;
-        } else {
-            // No bank groups; simply assign to bank number
-            banks[b].bankgr = b;
-        }
-    }
-}
+      pwrStateTrans(PWR_IDLE), pwrState(PWR_IDLE), pwrStateTick(0),
+      refreshState(REF_IDLE), refreshDueAt(0),
+      power(_p, false), numBanksActive(0),
+      activateEvent(*this), prechargeEvent(*this),
+      refreshEvent(*this), powerEvent(*this)
+{ }
 
 void
 DRAMCtrl::Rank::startup(Tick ref_tick)
@@ -1655,30 +1600,6 @@ void
 DRAMCtrl::Rank::suspend()
 {
     deschedule(refreshEvent);
-
-    // Update the stats
-    updatePowerStats();
-
-    // don't automatically transition back to LP state after next REF
-    pwrStatePostRefresh = PWR_IDLE;
-}
-
-bool
-DRAMCtrl::Rank::lowPowerEntryReady() const
-{
-    bool no_queued_cmds = ((memory.busStateNext == READ) && (readEntries == 0))
-                          || ((memory.busStateNext == WRITE) &&
-                              (writeEntries == 0));
-
-    if (refreshState == REF_RUN) {
-       // have not decremented outstandingEvents for refresh command
-       // still check if there are no commands queued to force PD
-       // entry after refresh completes
-       return no_queued_cmds;
-    } else {
-       // ensure no commands in Q and no commands scheduled
-       return (no_queued_cmds && (outstandingEvents == 0));
-    }
 }
 
 void
@@ -1689,39 +1610,11 @@ DRAMCtrl::Rank::checkDrainDone()
     if (refreshState == REF_DRAIN) {
         DPRINTF(DRAM, "Refresh drain done, now precharging\n");
 
-        refreshState = REF_PD_EXIT;
+        refreshState = REF_PRE;
 
         // hand control back to the refresh event loop
         schedule(refreshEvent, curTick());
     }
-}
-
-void
-DRAMCtrl::Rank::flushCmdList()
-{
-    // at the moment sort the list of commands and update the counters
-    // for DRAMPower libray when doing a refresh
-    sort(cmdList.begin(), cmdList.end(), DRAMCtrl::sortTime);
-
-    auto next_iter = cmdList.begin();
-    // push to commands to DRAMPower
-    for ( ; next_iter != cmdList.end() ; ++next_iter) {
-         Command cmd = *next_iter;
-         if (cmd.timeStamp <= curTick()) {
-             // Move all commands at or before curTick to DRAMPower
-             power.powerlib.doCommand(cmd.type, cmd.bank,
-                                      divCeil(cmd.timeStamp, memory.tCK) -
-                                      memory.timeStampOffset);
-         } else {
-             // done - found all commands at or before curTick()
-             // next_iter references the 1st command after curTick
-             break;
-         }
-    }
-    // reset cmdList to only contain commands after curTick
-    // if there are no commands after curTick, updated cmdList will be empty
-    // in this case, next_iter is cmdList.end()
-    cmdList.assign(next_iter, cmdList.end());
 }
 
 void
@@ -1737,58 +1630,25 @@ DRAMCtrl::Rank::processActivateEvent()
 void
 DRAMCtrl::Rank::processPrechargeEvent()
 {
-    // counter should at least indicate one outstanding request
-    // for this precharge
-    assert(outstandingEvents > 0);
-    // precharge complete, decrement count
-    --outstandingEvents;
-
     // if we reached zero, then special conditions apply as we track
     // if all banks are precharged for the power models
     if (numBanksActive == 0) {
-        // no reads to this rank in the Q and no pending
-        // RD/WR or refresh commands
-        if (lowPowerEntryReady()) {
-            // should still be in ACT state since bank still open
-            assert(pwrState == PWR_ACT);
-
-            // All banks closed - switch to precharge power down state.
-            DPRINTF(DRAMState, "Rank %d sleep at tick %d\n",
-                    rank, curTick());
-            powerDownSleep(PWR_PRE_PDN, curTick());
-        } else {
-            // we should transition to the idle state when the last bank
-            // is precharged
-            schedulePowerEvent(PWR_IDLE, curTick());
-        }
+        // we should transition to the idle state when the last bank
+        // is precharged
+        schedulePowerEvent(PWR_IDLE, curTick());
     }
-}
-
-void
-DRAMCtrl::Rank::processWriteDoneEvent()
-{
-    // counter should at least indicate one outstanding request
-    // for this write
-    assert(outstandingEvents > 0);
-    // Write transfer on bus has completed
-    // decrement per rank counter
-    --outstandingEvents;
 }
 
 void
 DRAMCtrl::Rank::processRefreshEvent()
 {
     // when first preparing the refresh, remember when it was due
-    if ((refreshState == REF_IDLE) || (refreshState == REF_SREF_EXIT)) {
+    if (refreshState == REF_IDLE) {
         // remember when the refresh is due
         refreshDueAt = curTick();
 
         // proceed to drain
         refreshState = REF_DRAIN;
-
-        // make nonzero while refresh is pending to ensure
-        // power down and self-refresh are not entered
-        ++outstandingEvents;
 
         DPRINTF(DRAM, "Refresh due\n");
     }
@@ -1807,28 +1667,15 @@ DRAMCtrl::Rank::processRefreshEvent()
 
             return;
         } else {
-            refreshState = REF_PD_EXIT;
-        }
-    }
-
-    // at this point, ensure that rank is not in a power-down state
-    if (refreshState == REF_PD_EXIT) {
-        // if rank was sleeping and we have't started exit process,
-        // wake-up for refresh
-        if (inLowPowerState) {
-            DPRINTF(DRAM, "Wake Up for refresh\n");
-            // save state and return after refresh completes
-            scheduleWakeUpEvent(memory.tXP);
-            return;
-        } else {
             refreshState = REF_PRE;
         }
     }
 
     // at this point, ensure that all banks are precharged
     if (refreshState == REF_PRE) {
-        // precharge any active bank
-        if (numBanksActive != 0) {
+        // precharge any active bank if we are not already in the idle
+        // state
+        if (pwrState != PWR_IDLE) {
             // at the moment, we use a precharge all even if there is
             // only a single bank open
             DPRINTF(DRAM, "Precharging all\n");
@@ -1857,27 +1704,22 @@ DRAMCtrl::Rank::processRefreshEvent()
             }
 
             // precharge all banks in rank
-            cmdList.push_back(Command(MemCommand::PREA, 0, pre_at));
+            power.powerlib.doCommand(MemCommand::PREA, 0,
+                                     divCeil(pre_at, memory.tCK) -
+                                     memory.timeStampOffset);
 
             DPRINTF(DRAMPower, "%llu,PREA,0,%d\n",
                     divCeil(pre_at, memory.tCK) -
                             memory.timeStampOffset, rank);
-        } else if ((pwrState == PWR_IDLE) && (outstandingEvents == 1))  {
-            // Banks are closed, have transitioned to IDLE state, and
-            // no outstanding ACT,RD/WR,Auto-PRE sequence scheduled
+        } else {
             DPRINTF(DRAM, "All banks already precharged, starting refresh\n");
 
-            // go ahead and kick the power state machine into gear since
+            // go ahead and kick the power state machine into gear if
             // we are already idle
             schedulePowerEvent(PWR_REF, curTick());
-        } else {
-            // banks state is closed but haven't transitioned pwrState to IDLE
-            // or have outstanding ACT,RD/WR,Auto-PRE sequence scheduled
-            // should have outstanding precharge event in this case
-            assert(prechargeEvent.scheduled());
-            // will start refresh when pwrState transitions to IDLE
         }
 
+        refreshState = REF_RUN;
         assert(numBanksActive == 0);
 
         // wait for all banks to be precharged, at which point the
@@ -1888,7 +1730,7 @@ DRAMCtrl::Rank::processRefreshEvent()
     }
 
     // last but not least we perform the actual refresh
-    if (refreshState == REF_START) {
+    if (refreshState == REF_RUN) {
         // should never get here with any banks active
         assert(numBanksActive == 0);
         assert(pwrState == PWR_REF);
@@ -1900,7 +1742,27 @@ DRAMCtrl::Rank::processRefreshEvent()
         }
 
         // at the moment this affects all ranks
-        cmdList.push_back(Command(MemCommand::REF, 0, curTick()));
+        power.powerlib.doCommand(MemCommand::REF, 0,
+                                 divCeil(curTick(), memory.tCK) -
+                                 memory.timeStampOffset);
+
+        // at the moment sort the list of commands and update the counters
+        // for DRAMPower libray when doing a refresh
+        sort(power.powerlib.cmdList.begin(),
+             power.powerlib.cmdList.end(), DRAMCtrl::sortTime);
+
+        // update the counters for DRAMPower, passing false to
+        // indicate that this is not the last command in the
+        // list. DRAMPower requires this information for the
+        // correct calculation of the background energy at the end
+        // of the simulation. Ideally we would want to call this
+        // function with true once at the end of the
+        // simulation. However, the discarded energy is extremly
+        // small and does not effect the final results.
+        power.powerlib.updateCounters(false);
+
+        // call the energy function
+        power.powerlib.calcEnergy();
 
         // Update the stats
         updatePowerStats();
@@ -1908,70 +1770,25 @@ DRAMCtrl::Rank::processRefreshEvent()
         DPRINTF(DRAMPower, "%llu,REF,0,%d\n", divCeil(curTick(), memory.tCK) -
                 memory.timeStampOffset, rank);
 
-        // Update for next refresh
-        refreshDueAt += memory.tREFI;
-
         // make sure we did not wait so long that we cannot make up
         // for it
-        if (refreshDueAt < ref_done_at) {
+        if (refreshDueAt + memory.tREFI < ref_done_at) {
             fatal("Refresh was delayed so long we cannot catch up\n");
         }
 
-        // Run the refresh and schedule event to transition power states
-        // when refresh completes
-        refreshState = REF_RUN;
-        schedule(refreshEvent, ref_done_at);
-        return;
-    }
-
-    if (refreshState == REF_RUN) {
-        // should never get here with any banks active
-        assert(numBanksActive == 0);
-        assert(pwrState == PWR_REF);
+        // compensate for the delay in actually performing the refresh
+        // when scheduling the next one
+        schedule(refreshEvent, refreshDueAt + memory.tREFI - memory.tRP);
 
         assert(!powerEvent.scheduled());
 
-        if ((memory.drainState() == DrainState::Draining) ||
-            (memory.drainState() == DrainState::Drained)) {
-            // if draining, do not re-enter low-power mode.
-            // simply go to IDLE and wait
-            schedulePowerEvent(PWR_IDLE, curTick());
-        } else {
-            // At the moment, we sleep when the refresh ends and wait to be
-            // woken up again if previously in a low-power state.
-            if (pwrStatePostRefresh != PWR_IDLE) {
-                // power State should be power Refresh
-                assert(pwrState == PWR_REF);
-                DPRINTF(DRAMState, "Rank %d sleeping after refresh and was in "
-                        "power state %d before refreshing\n", rank,
-                        pwrStatePostRefresh);
-                powerDownSleep(pwrState, curTick());
+        // move to the idle power state once the refresh is done, this
+        // will also move the refresh state machine to the refresh
+        // idle state
+        schedulePowerEvent(PWR_IDLE, ref_done_at);
 
-            // Force PRE power-down if there are no outstanding commands
-            // in Q after refresh.
-            } else if (lowPowerEntryReady()) {
-                DPRINTF(DRAMState, "Rank %d sleeping after refresh but was NOT"
-                        " in a low power state before refreshing\n", rank);
-                powerDownSleep(PWR_PRE_PDN, curTick());
-
-            } else {
-                // move to the idle power state once the refresh is done, this
-                // will also move the refresh state machine to the refresh
-                // idle state
-                schedulePowerEvent(PWR_IDLE, curTick());
-            }
-        }
-
-        // if transitioning to self refresh do not schedule a new refresh;
-        // when waking from self refresh, a refresh is scheduled again.
-        if (pwrStateTrans != PWR_SREF) {
-            // compensate for the delay in actually performing the refresh
-            // when scheduling the next one
-            schedule(refreshEvent, refreshDueAt - memory.tRP);
-
-            DPRINTF(DRAMState, "Refresh done at %llu and next refresh"
-                    " at %llu\n", curTick(), refreshDueAt);
-        }
+        DPRINTF(DRAMState, "Refresh done at %llu and next refresh at %llu\n",
+                ref_done_at, refreshDueAt + memory.tREFI);
     }
 }
 
@@ -1997,132 +1814,8 @@ DRAMCtrl::Rank::schedulePowerEvent(PowerState pwr_state, Tick tick)
 }
 
 void
-DRAMCtrl::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
-{
-    // if low power state is active low, schedule to active low power state.
-    // in reality tCKE is needed to enter active low power. This is neglected
-    // here and could be added in the future.
-    if (pwr_state == PWR_ACT_PDN) {
-        schedulePowerEvent(pwr_state, tick);
-        // push command to DRAMPower
-        cmdList.push_back(Command(MemCommand::PDN_F_ACT, 0, tick));
-        DPRINTF(DRAMPower, "%llu,PDN_F_ACT,0,%d\n", divCeil(tick,
-                memory.tCK) - memory.timeStampOffset, rank);
-    } else if (pwr_state == PWR_PRE_PDN) {
-        // if low power state is precharge low, schedule to precharge low
-        // power state. In reality tCKE is needed to enter active low power.
-        // This is neglected here.
-        schedulePowerEvent(pwr_state, tick);
-        //push Command to DRAMPower
-        cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
-        DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
-                memory.tCK) - memory.timeStampOffset, rank);
-    } else if (pwr_state == PWR_REF) {
-        // if a refresh just occured
-        // transition to PRE_PDN now that all banks are closed
-        // do not transition to SREF if commands are in Q; stay in PRE_PDN
-        if (pwrStatePostRefresh == PWR_ACT_PDN || !lowPowerEntryReady()) {
-            // prechage power down requires tCKE to enter. For simplicity
-            // this is not considered.
-            schedulePowerEvent(PWR_PRE_PDN, tick);
-            //push Command to DRAMPower
-            cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
-            DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
-                    memory.tCK) - memory.timeStampOffset, rank);
-        } else {
-            // last low power State was power precharge
-            assert(pwrStatePostRefresh == PWR_PRE_PDN);
-            // self refresh requires time tCKESR to enter. For simplicity,
-            // this is not considered.
-            schedulePowerEvent(PWR_SREF, tick);
-            // push Command to DRAMPower
-            cmdList.push_back(Command(MemCommand::SREN, 0, tick));
-            DPRINTF(DRAMPower, "%llu,SREN,0,%d\n", divCeil(tick,
-                    memory.tCK) - memory.timeStampOffset, rank);
-        }
-    }
-    // Ensure that we don't power-down and back up in same tick
-    // Once we commit to PD entry, do it and wait for at least 1tCK
-    // This could be replaced with tCKE if/when that is added to the model
-    wakeUpAllowedAt = tick + memory.tCK;
-
-    // Transitioning to a low power state, set flag
-    inLowPowerState = true;
-}
-
-void
-DRAMCtrl::Rank::scheduleWakeUpEvent(Tick exit_delay)
-{
-    Tick wake_up_tick = std::max(curTick(), wakeUpAllowedAt);
-
-    DPRINTF(DRAMState, "Scheduling wake-up for rank %d at tick %d\n",
-            rank, wake_up_tick);
-
-    // if waking for refresh, hold previous state
-    // else reset state back to IDLE
-    if (refreshState == REF_PD_EXIT) {
-        pwrStatePostRefresh = pwrState;
-    } else {
-        // don't automatically transition back to LP state after next REF
-        pwrStatePostRefresh = PWR_IDLE;
-    }
-
-    // schedule wake-up with event to ensure entry has completed before
-    // we try to wake-up
-    schedule(wakeUpEvent, wake_up_tick);
-
-    for (auto &b : banks) {
-        // respect both causality and any existing bank
-        // constraints, some banks could already have a
-        // (auto) precharge scheduled
-        b.colAllowedAt = std::max(wake_up_tick + exit_delay, b.colAllowedAt);
-        b.preAllowedAt = std::max(wake_up_tick + exit_delay, b.preAllowedAt);
-        b.actAllowedAt = std::max(wake_up_tick + exit_delay, b.actAllowedAt);
-    }
-    // Transitioning out of low power state, clear flag
-    inLowPowerState = false;
-
-    // push to DRAMPower
-    // use pwrStateTrans for cases where we have a power event scheduled
-    // to enter low power that has not yet been processed
-    if (pwrStateTrans == PWR_ACT_PDN) {
-        cmdList.push_back(Command(MemCommand::PUP_ACT, 0, wake_up_tick));
-        DPRINTF(DRAMPower, "%llu,PUP_ACT,0,%d\n", divCeil(wake_up_tick,
-                memory.tCK) - memory.timeStampOffset, rank);
-
-    } else if (pwrStateTrans == PWR_PRE_PDN) {
-        cmdList.push_back(Command(MemCommand::PUP_PRE, 0, wake_up_tick));
-        DPRINTF(DRAMPower, "%llu,PUP_PRE,0,%d\n", divCeil(wake_up_tick,
-                memory.tCK) - memory.timeStampOffset, rank);
-    } else if (pwrStateTrans == PWR_SREF) {
-        cmdList.push_back(Command(MemCommand::SREX, 0, wake_up_tick));
-        DPRINTF(DRAMPower, "%llu,SREX,0,%d\n", divCeil(wake_up_tick,
-                memory.tCK) - memory.timeStampOffset, rank);
-    }
-}
-
-void
-DRAMCtrl::Rank::processWakeUpEvent()
-{
-    // Should be in a power-down or self-refresh state
-    assert((pwrState == PWR_ACT_PDN) || (pwrState == PWR_PRE_PDN) ||
-           (pwrState == PWR_SREF));
-
-    // Check current state to determine transition state
-    if (pwrState == PWR_ACT_PDN) {
-        // banks still open, transition to PWR_ACT
-        schedulePowerEvent(PWR_ACT, curTick());
-    } else {
-        // transitioning from a precharge power-down or self-refresh state
-        // banks are closed - transition to PWR_IDLE
-        schedulePowerEvent(PWR_IDLE, curTick());
-    }
-}
-
-void
 DRAMCtrl::Rank::processPowerEvent()
 {
-    assert(curTick() >= pwrStateTick);
     // remember where we were, and for how long
     Tick duration = curTick() - pwrStateTick;
     PowerState prev_state = pwrState;
@@ -2130,80 +1823,36 @@ DRAMCtrl::Rank::processPowerEvent()
     // update the accounting
     pwrStateTime[prev_state] += duration;
 
-    // track to total idle time
-    if ((prev_state == PWR_PRE_PDN) || (prev_state == PWR_ACT_PDN) ||
-        (prev_state == PWR_SREF)) {
-        totalIdleTime += duration;
-    }
-
     pwrState = pwrStateTrans;
     pwrStateTick = curTick();
 
-    // if rank was refreshing, make sure to start scheduling requests again
-    if (prev_state == PWR_REF) {
-        // bus IDLED prior to REF
-        // counter should be one for refresh command only
-        assert(outstandingEvents == 1);
-        // REF complete, decrement count
-        --outstandingEvents;
-
-        DPRINTF(DRAMState, "Was refreshing for %llu ticks\n", duration);
-        // if sleeping after refresh
-        if (pwrState != PWR_IDLE) {
-            assert((pwrState == PWR_PRE_PDN) || (pwrState == PWR_SREF));
-            DPRINTF(DRAMState, "Switching to power down state after refreshing"
-                    " rank %d at %llu tick\n", rank, curTick());
-        }
-        if (pwrState != PWR_SREF) {
-            // rank is not available in SREF
-            // don't transition to IDLE in this case
-            refreshState = REF_IDLE;
-        }
-        // a request event could be already scheduled by the state
-        // machine of the other rank
-        if (!memory.nextReqEvent.scheduled()) {
-            DPRINTF(DRAM, "Scheduling next request after refreshing rank %d\n",
-                    rank);
-            schedule(memory.nextReqEvent, curTick());
-        }
-    } else if (pwrState == PWR_ACT) {
-        if (refreshState == REF_PD_EXIT) {
-            // kick the refresh event loop into action again
-            assert(prev_state == PWR_ACT_PDN);
-
-            // go back to REF event and close banks
-            refreshState = REF_PRE;
-            schedule(refreshEvent, curTick());
-        }
-    } else if (pwrState == PWR_IDLE) {
+    if (pwrState == PWR_IDLE) {
         DPRINTF(DRAMState, "All banks precharged\n");
-        if (prev_state == PWR_SREF) {
-            // set refresh state to REF_SREF_EXIT, ensuring isAvailable
-            // continues to return false during tXS after SREF exit
-            // Schedule a refresh which kicks things back into action
-            // when it finishes
-            refreshState = REF_SREF_EXIT;
-            schedule(refreshEvent, curTick() + memory.tXS);
+
+        // if we were refreshing, make sure we start scheduling requests again
+        if (prev_state == PWR_REF) {
+            DPRINTF(DRAMState, "Was refreshing for %llu ticks\n", duration);
+            assert(pwrState == PWR_IDLE);
+
+            // kick things into action again
+            refreshState = REF_IDLE;
+            // a request event could be already scheduled by the state
+            // machine of the other rank
+            if (!memory.nextReqEvent.scheduled())
+                schedule(memory.nextReqEvent, curTick());
         } else {
+            assert(prev_state == PWR_ACT);
+
             // if we have a pending refresh, and are now moving to
-            // the idle state, directly transition to a refresh
-            if ((refreshState == REF_PRE) || (refreshState == REF_PD_EXIT)) {
-                // ensure refresh is restarted only after final PRE command.
-                // do not restart refresh if controller is in an intermediate
-                // state, after PRE_PDN exit, when banks are IDLE but an
-                // ACT is scheduled.
-                if (!activateEvent.scheduled()) {
-                    // there should be nothing waiting at this point
-                    assert(!powerEvent.scheduled());
-                    // update the state in zero time and proceed below
-                    pwrState = PWR_REF;
-                } else {
-                    // must have PRE scheduled to transition back to IDLE
-                    // and re-kick off refresh
-                    assert(prechargeEvent.scheduled());
-                }
+            // the idle state, direclty transition to a refresh
+            if (refreshState == REF_RUN) {
+                // there should be nothing waiting at this point
+                assert(!powerEvent.scheduled());
+
+                // update the state in zero time and proceed below
+                pwrState = PWR_REF;
             }
-       }
+        }
     }
 
     // we transition to the refresh state, let the refresh state
@@ -2211,43 +1860,18 @@ DRAMCtrl::Rank::processPowerEvent()
     // scheduling of the next power state transition as well as the
     // following refresh
     if (pwrState == PWR_REF) {
-        assert(refreshState == REF_PRE || refreshState == REF_PD_EXIT);
         DPRINTF(DRAMState, "Refreshing\n");
-
         // kick the refresh event loop into action again, and that
         // in turn will schedule a transition to the idle power
         // state once the refresh is done
-        if (refreshState == REF_PD_EXIT) {
-            // Wait for PD exit timing to complete before issuing REF
-            schedule(refreshEvent, curTick() + memory.tXP);
-        } else {
-            schedule(refreshEvent, curTick());
-        }
-        // Banks transitioned to IDLE, start REF
-        refreshState = REF_START;
+        assert(refreshState == REF_RUN);
+        processRefreshEvent();
     }
 }
 
 void
 DRAMCtrl::Rank::updatePowerStats()
 {
-    // All commands up to refresh have completed
-    // flush cmdList to DRAMPower
-    flushCmdList();
-
-    // update the counters for DRAMPower, passing false to
-    // indicate that this is not the last command in the
-    // list. DRAMPower requires this information for the
-    // correct calculation of the background energy at the end
-    // of the simulation. Ideally we would want to call this
-    // function with true once at the end of the
-    // simulation. However, the discarded energy is extremly
-    // small and does not effect the final results.
-    power.powerlib.updateCounters(false);
-
-    // call the energy function
-    power.powerlib.calcEnergy();
-
     // Get the energy and power from DRAMPower
     Data::MemoryPowerModel::Energy energy =
         power.powerlib.getEnergy();
@@ -2261,29 +1885,8 @@ DRAMCtrl::Rank::updatePowerStats()
     refreshEnergy = energy.ref_energy * memory.devicesPerRank;
     actBackEnergy = energy.act_stdby_energy * memory.devicesPerRank;
     preBackEnergy = energy.pre_stdby_energy * memory.devicesPerRank;
-    actPowerDownEnergy = energy.f_act_pd_energy * memory.devicesPerRank;
-    prePowerDownEnergy = energy.f_pre_pd_energy * memory.devicesPerRank;
-    selfRefreshEnergy = energy.sref_energy * memory.devicesPerRank;
     totalEnergy = energy.total_energy * memory.devicesPerRank;
     averagePower = rank_power.average_power * memory.devicesPerRank;
-}
-
-void
-DRAMCtrl::Rank::computeStats()
-{
-    DPRINTF(DRAM,"Computing final stats\n");
-
-    // Force DRAM power to update counters based on time spent in
-    // current state up to curTick()
-    cmdList.push_back(Command(MemCommand::NOP, 0, curTick()));
-
-    // Update the stats
-    updatePowerStats();
-
-    // final update of power state times
-    pwrStateTime[pwrState] += (curTick() - pwrStateTick);
-    pwrStateTick = curTick();
-
 }
 
 void
@@ -2292,15 +1895,14 @@ DRAMCtrl::Rank::regStats()
     using namespace Stats;
 
     pwrStateTime
-        .init(6)
+        .init(5)
         .name(name() + ".memoryStateTime")
         .desc("Time in different power states");
     pwrStateTime.subname(0, "IDLE");
     pwrStateTime.subname(1, "REF");
-    pwrStateTime.subname(2, "SREF");
-    pwrStateTime.subname(3, "PRE_PDN");
-    pwrStateTime.subname(4, "ACT");
-    pwrStateTime.subname(5, "ACT_PDN");
+    pwrStateTime.subname(2, "PRE_PDN");
+    pwrStateTime.subname(3, "ACT");
+    pwrStateTime.subname(4, "ACT_PDN");
 
     actEnergy
         .name(name() + ".actEnergy")
@@ -2330,18 +1932,6 @@ DRAMCtrl::Rank::regStats()
         .name(name() + ".preBackEnergy")
         .desc("Energy for precharge background per rank (pJ)");
 
-    actPowerDownEnergy
-        .name(name() + ".actPowerDownEnergy")
-        .desc("Energy for active power-down per rank (pJ)");
-
-    prePowerDownEnergy
-        .name(name() + ".prePowerDownEnergy")
-        .desc("Energy for precharge power-down per rank (pJ)");
-
-    selfRefreshEnergy
-        .name(name() + ".selfRefreshEnergy")
-        .desc("Energy for self refresh per rank (pJ)");
-
     totalEnergy
         .name(name() + ".totalEnergy")
         .desc("Total energy per rank (pJ)");
@@ -2349,12 +1939,6 @@ DRAMCtrl::Rank::regStats()
     averagePower
         .name(name() + ".averagePower")
         .desc("Core power per rank (mW)");
-
-    totalIdleTime
-        .name(name() + ".totalIdleTime")
-        .desc("Total Idle time Per DRAM Rank");
-
-    registerDumpCallback(new RankDumpCallback(this));
 }
 void
 DRAMCtrl::regStats()
@@ -2632,51 +2216,33 @@ DRAMCtrl::getSlavePort(const string &if_name, PortID idx)
     }
 }
 
-DrainState
-DRAMCtrl::drain()
+unsigned int
+DRAMCtrl::drain(DrainManager *dm)
 {
+    unsigned int count = port.drain(dm);
+
     // if there is anything in any of our internal queues, keep track
     // of that as well
-    if (!(writeQueue.empty() && readQueue.empty() && respQueue.empty() &&
-          allRanksDrained())) {
-
+    if (!(writeQueue.empty() && readQueue.empty() &&
+          respQueue.empty())) {
         DPRINTF(Drain, "DRAM controller not drained, write: %d, read: %d,"
                 " resp: %d\n", writeQueue.size(), readQueue.size(),
                 respQueue.size());
+        ++count;
+        drainManager = dm;
 
-        // the only queue that is not drained automatically over time
+        // the only part that is not drained automatically over time
         // is the write queue, thus kick things into action if needed
         if (!writeQueue.empty() && !nextReqEvent.scheduled()) {
             schedule(nextReqEvent, curTick());
         }
-
-        // also need to kick off events to exit self-refresh
-        for (auto r : ranks) {
-            // force self-refresh exit, which in turn will issue auto-refresh
-            if (r->pwrState == PWR_SREF) {
-                DPRINTF(DRAM,"Rank%d: Forcing self-refresh wakeup in drain\n",
-                        r->rank);
-                r->scheduleWakeUpEvent(tXS);
-            }
-        }
-
-        return DrainState::Draining;
-    } else {
-        return DrainState::Drained;
     }
-}
 
-bool
-DRAMCtrl::allRanksDrained() const
-{
-    // true until proven false
-    bool all_ranks_drained = true;
-    for (auto r : ranks) {
-        // then verify that the power state is IDLE
-        // ensuring all banks are closed and rank is not in a low power state
-        all_ranks_drained = r->inPwrIdleState() && all_ranks_drained;
-    }
-    return all_ranks_drained;
+    if (count)
+        setDrainState(Drainable::Draining);
+    else
+        setDrainState(Drainable::Drained);
+    return count;
 }
 
 void
